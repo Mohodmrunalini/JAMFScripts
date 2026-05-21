@@ -1,0 +1,36 @@
+#!/bin/zsh
+
+used_percent="$(
+/usr/bin/osascript <<'APPLESCRIPT' 2>/dev/null
+use framework "Foundation"
+use scripting additions
+
+set volumeURL to current application's NSURL's fileURLWithPath:"/"
+
+on numberForKey(theURL, theKey)
+    set {ok, value, err} to (theURL's getResourceValue:(reference) forKey:theKey |error|:(reference))
+    if (ok as boolean) is false or value is missing value then return missing value
+    return (value's doubleValue()) as real
+end numberForKey
+
+set availableBytes to numberForKey(volumeURL, current application's NSURLVolumeAvailableCapacityForImportantUsageKey)
+
+if availableBytes is missing value then
+    set availableBytes to numberForKey(volumeURL, current application's NSURLVolumeAvailableCapacityKey)
+else if availableBytes <= 0 then
+    set fallbackBytes to numberForKey(volumeURL, current application's NSURLVolumeAvailableCapacityKey)
+    if fallbackBytes is not missing value then set availableBytes to fallbackBytes
+end if
+
+set totalBytes to numberForKey(volumeURL, current application's NSURLVolumeTotalCapacityKey)
+
+if availableBytes is missing value then return "-1"
+if totalBytes is missing value then return "-1"
+if totalBytes <= 0 then return "-1"
+
+set usedPercent to ((totalBytes - availableBytes) / totalBytes) * 100
+return (round usedPercent) as string
+APPLESCRIPT
+)"
+
+if [[ "$used_percent" =~ '^[0-9]+$' ]]; then
