@@ -1,0 +1,57 @@
+#!/bin/bash
+#This EA fetches the Platform SSO status for the logged-in user. Data type is String
+psso_state="Unknown"
+
+APPSO_BIN="/usr/bin/app-sso"
+if [ ! -x "$APPSO_BIN" ]; then
+  APPSO_BIN="$(command -v app-sso 2>/dev/null)"
+fi
+
+if [ -z "$APPSO_BIN" ]; then
+  echo "<result>app-sso not installed</result>"
+  exit 0
+fi
+
+console_user=$( echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }' )
+
+if [ -z "$console_user" ] || [ "$console_user" = "root" ] || [ "$console_user" = "loginwindow" ]; then
+  echo "<result>No user logged in</result>"
+  exit 0
+fi
+
+user_config=$(/usr/bin/sudo -u "$console_user" "$APPSO_BIN" platform -s 2>/dev/null | awk '
+  /User Configuration:/ {in_block=1; next}
+  /^$/ && in_block {in_block=0}
+  in_block {print}
+')
+
+if [ -z "$user_config" ] || echo "$user_config" | grep -qi "(null)"; then
+  echo "<result>Not Registered</result>"
+  exit 0
+fi
+
+raw_state=$(echo "$user_config" \
+  | grep -i '"state"' \
+  | sed -E 's/.*"state"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' \
+  | head -n1)
+
+if [ -z "$raw_state" ]; then
+  echo "<result>Not Registered</result>"
+  exit 0
+fi
+
+state_lc=$(printf '%s' "$raw_state" | tr '[:upper:]' '[:lower:]')
+
+case "$state_lc" in
+  pouserstatenormal*)
+    psso_state="Registered"
+    ;;
+  pouserstatepending*)
+    psso_state="Pending Registration"
+    ;;
+  *)
+    psso_state="$raw_state"
+    ;;
+esac
+
+echo "<result>${psso_state}</result>"
