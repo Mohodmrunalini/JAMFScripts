@@ -1,0 +1,258 @@
+#!/bin/zsh
+# Version: 1.3
+# Jamf computer EA: JSC Setup Completion. Data type: String.
+# Persists wallpaper-only evidence as root; --read-only previews without writes.
+# Results: Complete, Incomplete, Wall and Screen. No policies or UI are invoked.
+
+receipt="/Library/Euc/State/JSC/completion.plist"
+migrationReceipt="/Library/Euc/State/JSC/existing-fleet-migration.plist"
+stateBase="/Library/Euc"
+wallpaperReceipt="$stateBase/State/JSC/wallpaper-only.plist"
+
+valid_timestamp() {
+    [[ "$1" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ]] &&
+        /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' >/dev/null 2>&1
+}
+
+trusted_file() {
+    local mode=""
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    [[ "$(/usr/bin/stat -f '%u:%l' "$1" 2>/dev/null)" == 0:1 ]] || return 1
+    mode="$(/usr/bin/stat -f %Lp "$1")" || return 1
+    (( (8#$mode & 8#022) == 0 ))
+}
+
+trusted_receipt() {
+    trusted_file "$1" || return 1
+    [[ "$(/usr/bin/plutil -extract SchemaVersion raw -o - "$1" 2>/dev/null)" == 1 ]] &&
+        [[ "$(/usr/bin/plutil -extract State raw -o - "$1" 2>/dev/null)" == Complete ]]
+}
+
+device_completed() {
+    local workflow="" completed=""
+    trusted_receipt "$receipt" || return 1
+    workflow="$(/usr/bin/plutil -extract Workflow raw -o - "$receipt" 2>/dev/null)"
+    completed="$(/usr/bin/plutil -extract CompletedAtUTC raw -o - "$receipt" 2>/dev/null)"
+    [[ "$workflow" == standard-v1 || "$workflow" == china-v1 ]] && valid_timestamp "$completed"
+}
+
+explicit_migration() {
+    trusted_receipt "$migrationReceipt" || return 1
+    [[ "$(/usr/bin/plutil -extract Source raw -o - "$migrationReceipt" 2>/dev/null)" == existing-fleet-migration ]] &&
+        valid_timestamp "$(/usr/bin/plutil -extract MigratedAtUTC raw -o - "$migrationReceipt" 2>/dev/null)"
+}
+
+wallpaper_directories() {
+    local directory="" mode=""
+    for directory in "$stateBase" "$stateBase/State" "$stateBase/State/JSC"; do
+        [[ ! -L "$directory" ]] || return 1
+        if [[ ! -e "$directory" && "${1:-}" == create ]]; then
+            /usr/bin/install -d -o root -g wheel -m 755 "$directory" || return 1
+        fi
+        [[ -d "$directory" && "$(/usr/bin/stat -f %u "$directory")" == 0 ]] || return 1
+        mode="$(/usr/bin/stat -f %Lp "$directory")" || return 1
+        (( (8#$mode & 8#022) == 0 )) || return 1
+    done
+}
+
+wallpaper_seen() {
+    local source=""
+    wallpaper_directories || return 1
+    trusted_file "$wallpaperReceipt" || return 1
+    [[ "$(/usr/bin/plutil -extract SchemaVersion raw -o - "$wallpaperReceipt" 2>/dev/null)" == 1 ]] || return 1
+    [[ "$(/usr/bin/plutil -extract State raw -o - "$wallpaperReceipt" 2>/dev/null)" == 'Wall and Screen' ]] || return 1
+    source="$(/usr/bin/plutil -extract Source raw -o - "$wallpaperReceipt" 2>/dev/null)"
+    case "$source" in wallpaper-only-opened|wallpaper-only-profile-migration) ;; *) return 1 ;; esac
+    valid_timestamp "$(/usr/bin/plutil -extract FirstObservedAtUTC raw -o - "$wallpaperReceipt" 2>/dev/null)"
+}
+
+persist_wallpaper() (
+    # Subshell confines the lock and cleanup trap; never overwrite an invalid receipt.
+    local source="$1" temporary="" lockFD="" lockFile="$stateBase/State/JSC/.wallpaper-only.lock"
+    (( EUID == 0 )) || { print -u2 'JSC EA: Run as root to persist wallpaper-only evidence, or use --read-only.'; return 1; }
+    case "$source" in wallpaper-only-opened|wallpaper-only-profile-migration) ;; *) return 1 ;; esac
+    wallpaper_directories create || { print -u2 'JSC EA: Unsafe or unwritable device state directory.'; return 1; }
+    if [[ ! -e "$lockFile" && ! -L "$lockFile" ]]; then
+        (set -C; umask 077; : > "$lockFile") 2>/dev/null || true
+    fi
+    trusted_file "$lockFile" || return 1
+    zmodload zsh/system || return 1
+    zsystem flock -t 2 -f lockFD "$lockFile" || return 1
+    if [[ -e "$wallpaperReceipt" || -L "$wallpaperReceipt" ]]; then
+        wallpaper_seen || { print -u2 'JSC EA: Invalid wallpaper-only receipt preserved for investigation.'; return 1; }
+        return 0
+    fi
+    temporary="$(/usr/bin/mktemp "$stateBase/State/JSC/.wallpaper-only.XXXXXX")" || return 1
+    trap '/bin/rm -f -- "$temporary"' EXIT
+    /usr/bin/plutil -create xml1 "$temporary" &&
+        /usr/bin/plutil -insert SchemaVersion -integer 1 "$temporary" &&
+        /usr/bin/plutil -insert State -string 'Wall and Screen' "$temporary" &&
+        /usr/bin/plutil -insert Source -string "$source" "$temporary" &&
+        /usr/bin/plutil -insert FirstObservedAtUTC -string "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" "$temporary" &&
+        /usr/bin/plutil -insert EAVersion -string 1.3 "$temporary" &&
+        /usr/sbin/chown root:wheel "$temporary" && /bin/chmod 644 "$temporary" &&
+        /bin/mv -f "$temporary" "$wallpaperReceipt"
+)
+
+context_result() {
+    # Inspect managed settings and all local user homes, including at loginwindow.
+    # Foundation/dscl are built into macOS; no Python, developer tools, or PPPC.
+    /usr/bin/osascript -l JavaScript <<'JSC_COMPLETION_CONTEXT'
+ObjC.import("Foundation")
+
+const fm = $.NSFileManager.defaultManager
+const domain = "com.jamf.setupchecklist.plist"
+const wallpaperIDs = ["wallpaper-standard", "branded-screensaver-v6"]
+const workflows = ["standard-v1", "china-v1"]
+
+function attributes(path) {
+    const error = $()
+    const info = ObjC.deepUnwrap(fm.attributesOfItemAtPathError($(path), error)) || null
+    if (!info && [4, 260].indexOf(Number(error.code)) < 0) throw new Error("Cannot read file metadata")
+    return info
+}
+
+function dictionary(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function readPlist(path, owner) {
+    const info = attributes(path)
+    if (!info) return null
+    if (info.NSFileType !== "NSFileTypeRegular" || info.NSFileOwnerAccountID !== owner ||
+        (info.NSFilePosixPermissions & 18) !== 0 || info.NSFileSize > 4194304) {
+        throw new Error("Untrusted or oversized preference file")
+    }
+    const value = ObjC.deepUnwrap($.NSDictionary.dictionaryWithContentsOfFile($(path)))
+    if (!dictionary(value)) throw new Error("Unreadable preference file")
+    return value
+}
+
+function children(path) {
+    const info = attributes(path)
+    if (!info) return []
+    if (info.NSFileType !== "NSFileTypeDirectory") throw new Error("Unexpected directory type")
+    const names = ObjC.deepUnwrap(fm.contentsOfDirectoryAtPathError($(path), null))
+    if (!Array.isArray(names)) throw new Error("Cannot list directory")
+    return names
+}
+
+function wallpaperOnly(prefs) {
+    if (!Array.isArray(prefs.steps) || prefs.steps.length !== 2) return false
+    return wallpaperIDs.every((id, index) => prefs.steps.some(step =>
+        dictionary(step) && step.identifier === id && step.kind === ["wallpaper", "script"][index]))
+}
+
+function hasWorkflow(prefs) {
+    // Treat stale/mixed markers conservatively too; never exempt a full setup.
+    return !!prefs.cnResumeWorkflowID || !!prefs.cnConfigVariant
+}
+
+function doneReceipt(path, owner) {
+    const info = attributes(path)
+    if (!info) return false
+    if (info.NSFileType !== "NSFileTypeRegular" || info.NSFileOwnerAccountID !== owner ||
+        info.NSFileReferenceCount !== 1 || (info.NSFilePosixPermissions & 18) !== 0 || info.NSFileSize > 64) return false
+    const text = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(path), $.NSUTF8StringEncoding, null))
+    if (typeof text !== "string") return false
+    const stamp = text.trim()
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(stamp)) return false
+    const date = new Date(stamp)
+    return !isNaN(date.getTime()) && date.toISOString().replace(".000Z", "Z") === stamp
+}
+
+function localAccounts() {
+    const task = $.NSTask.alloc.init
+    const pipe = $.NSPipe.pipe
+    task.launchPath = "/usr/bin/dscl"
+    task.arguments = $(["-plist", ".", "-readall", "/Users", "UniqueID", "NFSHomeDirectory"])
+    task.standardOutput = pipe
+    task.standardError = $.NSFileHandle.fileHandleWithNullDevice
+    task.launch
+    const data = pipe.fileHandleForReading.readDataToEndOfFile
+    task.waitUntilExit
+    if (task.terminationStatus !== 0) throw new Error("Cannot enumerate local accounts")
+    const records = ObjC.deepUnwrap($.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null))
+    if (!Array.isArray(records)) throw new Error("Unexpected directory service response")
+    return records.map(record => ({
+        uid: Number((record["dsAttrTypeStandard:UniqueID"] || [])[0]),
+        home: (record["dsAttrTypeStandard:NFSHomeDirectory"] || [])[0]
+    })).filter(record => Number.isInteger(record.uid) && record.uid >= 500 &&
+        typeof record.home === "string" && record.home[0] === "/" && record.home !== "/var/empty")
+}
+
+function inspectContext(managedRoot, appPath, accounts, deviceOwner) {
+    let blocked = false, wallpaper = false, completed = false, opened = false
+    try {
+        const paths = [managedRoot + "/" + domain]
+        children(managedRoot).forEach(name => {
+            const child = managedRoot + "/" + name
+            const info = attributes(child)
+            if (info && info.NSFileType === "NSFileTypeDirectory") paths.push(child + "/" + domain)
+            if (info && info.NSFileType === "NSFileTypeSymbolicLink") blocked = true
+        })
+        paths.forEach(path => {
+            const prefs = readPlist(path, deviceOwner)
+            if (!prefs) return
+            if (hasWorkflow(prefs)) blocked = true
+            if (Object.prototype.hasOwnProperty.call(prefs, "steps")) {
+                if (wallpaperOnly(prefs)) wallpaper = true
+                else blocked = true
+            }
+        })
+    } catch (error) { blocked = true }
+
+    accounts.forEach(account => {
+        try {
+            const state = account.home + "/Library/Application Support/com.condenast.jsc-resume/"
+            workflows.forEach(workflow => {
+                if (doneReceipt(state + workflow + ".completed", account.uid)) completed = true
+            })
+            // This dedicated receipt is written only by the wallpaper-only config.
+            // Native statuses are deliberately ignored: they survive profile changes.
+            if (doneReceipt(account.home + "/Library/Application Support/com.condenast.jsc-wallpaper/wallpaper-only.opened", account.uid)) opened = true
+        } catch (error) { /* Another account or the managed profile may still provide evidence. */ }
+    })
+    // Historic wallpaper launches survive profile/app removal; real Done always wins.
+    if (completed) return "Complete"
+    if (opened) return "Wallpaper Opened"
+    if (blocked || !wallpaper) return "Incomplete"
+    try {
+        const app = readPlist(appPath + "/Contents/Info.plist", deviceOwner)
+        if (app && app.CFBundleIdentifier === "com.jamf.setupchecklist") return "Wallpaper Profile"
+    } catch (error) { /* Missing/unreadable app is not an exemption. */ }
+    return "Incomplete"
+}
+
+inspectContext("/Library/Managed Preferences", "/Applications/Setup Checklist.app", localAccounts(), 0)
+JSC_COMPLETION_CONTEXT
+}
+
+main() {
+    local result="Incomplete" observed="" source=""
+    if device_completed; then
+        result="Complete"
+    else
+        observed="$(context_result 2>/dev/null)" || observed="Incomplete"
+        if [[ "$observed" == Complete ]]; then
+            result=Complete
+        elif wallpaper_seen || explicit_migration; then
+            result='Wall and Screen'
+        else
+            case "$observed" in
+                'Wallpaper Opened') source=wallpaper-only-opened ;;
+                'Wallpaper Profile') source=wallpaper-only-profile-migration ;;
+            esac
+            if [[ -n "$source" ]]; then
+                if [[ "${1:-}" == --read-only ]] || persist_wallpaper "$source"; then
+                    result='Wall and Screen'
+                else
+                    print -u2 'JSC EA: Could not preserve wallpaper-only evidence; reporting Incomplete.'
+                fi
+            fi
+        fi
+    fi
+    printf '<result>%s</result>\n' "$result"
+}
+
+main "$@"
