@@ -1,0 +1,111 @@
+#!/bin/sh
+# Apple Intelligence Availability - Jamf Extension Attribute (macOS 15.x, DSID-aware)
+#It runs as root, figures out the logged-in user, reads that user’s Apple Intelligence opt-in plist, prefers the opt-in value tied to the user’s Apple ID DSID if available, otherwise falls back to other keys/device, then returns On/Off/Not Set for Jamf.
+
+getAIStatus() {
+  # --- Identify console user ---
+  local consoleUser consoleUserID userHome
+  consoleUser=$(stat -f %Su /dev/console)
+
+  if [ "$consoleUser" = "root" ] || [ "$consoleUser" = "loginwindow" ] || [ -z "$consoleUser" ]; then
+    consoleUser=$(/usr/bin/last -1 -t console | awk '{print $1}')
+  fi
+
+  consoleUserID=$(id -u "$consoleUser" 2>/dev/null) || { echo "Not Set ()"; return 0; }
+  userHome=$(dscl . -read "/Users/$consoleUser" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -z "$userHome" ] && { echo "Not Set ()"; return 0; }
+
+  runAsUser() {
+    launchctl asuser "$consoleUserID" /usr/bin/sudo -u "$consoleUser" env HOME="$userHome" "$@"
+  }
+
+  # --- Export opt-in plist (contains device + possibly DSID/numeric keys) ---
+  local optIn
+  optIn=$(runAsUser /usr/bin/defaults export com.apple.CloudSubscriptionFeatures.optIn - 2>/dev/null)
+  [ -z "$optIn" ] && { echo "Not Set ()"; return 0; }
+
+  # --- Helper: get AccountDSID from MobileMeAccounts by iterating Accounts array ---
+  getPrimaryDSID() {
+    local mme
+    mme=$(runAsUser /usr/bin/defaults export MobileMeAccounts - 2>/dev/null)
+    [ -z "$mme" ] && return 1
+
+    local i=0 dsid isPrimary hasUUID
+
+    # First pass: prefer IsPrimaryAccount == true (if present)
+    while :; do
+      dsid=$(/usr/libexec/PlistBuddy -c "Print :Accounts:$i:AccountDSID" /dev/stdin <<<"$mme" 2>/dev/null) || break
+      isPrimary=$(/usr/libexec/PlistBuddy -c "Print :Accounts:$i:IsPrimaryAccount" /dev/stdin <<<"$mme" 2>/dev/null)
+      if [ "$isPrimary" = "true" ]; then
+        echo "$dsid"
+        return 0
+      fi
+      i=$((i+1))
+    done
+
+    # Second pass: prefer entry that has AccountUUID (often only the primary iCloud account)
+    i=0
+    while :; do
+      dsid=$(/usr/libexec/PlistBuddy -c "Print :Accounts:$i:AccountDSID" /dev/stdin <<<"$mme" 2>/dev/null) || break
+      hasUUID=$(/usr/libexec/PlistBuddy -c "Print :Accounts:$i:AccountUUID" /dev/stdin <<<"$mme" 2>/dev/null)
+      if [ -n "$hasUUID" ]; then
+        echo "$dsid"
+        return 0
+      fi
+      i=$((i+1))
+    done
+
+    # Last resort: first AccountDSID found
+    i=0
+    dsid=$(/usr/libexec/PlistBuddy -c "Print :Accounts:$i:AccountDSID" /dev/stdin <<<"$mme" 2>/dev/null) || return 1
+    echo "$dsid"
+    return 0
+  }
+
+  local dsid=""
+  dsid=$(getPrimaryDSID 2>/dev/null)
+
+  # --- Read device value if present ---
+  local deviceVal=""
+  if /usr/libexec/PlistBuddy -c "Print :device" /dev/stdin <<<"$optIn" >/dev/null 2>&1; then
+    deviceVal=$(/usr/libexec/PlistBuddy -c "Print :device" /dev/stdin <<<"$optIn" 2>/dev/null)
+  fi
+
+  # --- Prefer DSID key if we have one and it exists in optIn ---
+  local value=""
+  if [ -n "$dsid" ] && /usr/libexec/PlistBuddy -c "Print :$dsid" /dev/stdin <<<"$optIn" >/dev/null 2>&1; then
+    value=$(/usr/libexec/PlistBuddy -c "Print :$dsid" /dev/stdin <<<"$optIn" 2>/dev/null)
+  else
+    # Otherwise, prefer any non-device boolean key (covers your "device=false but numeric=true" case)
+    local keys k v
+    keys=$(/usr/libexec/PlistBuddy -c "Print" /dev/stdin <<<"$optIn" 2>/dev/null \
+      | awk -F'=' '/=/{gsub(/[[:space:]]/,"",$1); print $1}')
+    for k in $keys; do
+      [ "$k" = "device" ] && continue
+      v=$(/usr/libexec/PlistBuddy -c "Print :$k" /dev/stdin <<<"$optIn" 2>/dev/null)
+      if [ "$v" = "true" ] || [ "$v" = "false" ]; then
+        value="$v"
+        break
+      fi
+    done
+
+    # If still empty, fall back to device
+    [ -z "$value" ] && value="$deviceVal"
+  fi
+
+  # --- Interpret ---
+  local interpretation="Not Set"
+  case "$value" in
+    true)  interpretation="On" ;;
+    false) interpretation="Off" ;;
+    "")    interpretation="Not Set" ;;
+  esac
+
+  echo "${interpretation} ($value)"
+}
+
+[ "$UID" -ne 0 ] && { echo "Run as root, exiting." >&2; exit 1; }
+
+result=$(getAIStatus)
+echo "<result>${result}</result>"
+exit 0
