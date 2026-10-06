@@ -1,0 +1,14 @@
+#!/bin/bash
+#Checks Rapid7 version. If not installed displays as '0'
+
+if [ -e /opt/rapid7/ir_agent/components/insight_agent/common/agent.log ]; then
+echo "<result>`grep "Agent Info" /opt/rapid7/ir_agent/components/insight_agent/common/agent.log | tail -n1 | tr ' ' '
+' | awk '/Version:/{getline; print}'`</result>"
+else echo "<result>0</result>"
+fi#!/bin/bash
+
+if [ -e /opt/rapid7/ir_agent/components/insight_agent/common/agent.log ]; then
+echo "<result>`grep "Agent Info" /opt/rapid7/ir_agent/components/insight_agent/common/agent.log | tail -n1 | tr ' ' '
+' | awk '/Version:/{getline; print}'`</result>"
+else echo "<result>0</result>"
+fi
