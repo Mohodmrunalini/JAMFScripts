@@ -1,0 +1,29 @@
+#!/bin/bash
+#Contains Healthy - Healthy Contains Failed - Failed Missing or empty - Pending Unexpected content - Unknown
+
+STATUS_FILE="/Library/Application Support/CN/JSM/provisioning_status.txt"
+
+if [[ ! -f "$STATUS_FILE" ]]; then
+  echo "<result>Pending</result>"
+  exit 0
+fi
+
+STATUS="$(/usr/bin/head -n 1 "$STATUS_FILE" 2>/dev/null | /usr/bin/tr -d '\r\n')"
+
+case "$STATUS" in
+  Healthy)
+    RESULT="Healthy"
+    ;;
+  Failed)
+    RESULT="Failed"
+    ;;
+  "")
+    RESULT="Pending"
+    ;;
+  *)
+    RESULT="Unknown"
+    ;;
+esac
+
+echo "<result>$RESULT</result>"
+exit 0
