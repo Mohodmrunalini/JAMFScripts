@@ -2,14 +2,13 @@
 #
 # RemoveAdobeApps.sh
 #
-# 
+# by: Scott Kendall
 # Modified By Mru
 #
 # Written: 04/29/2025
 # Last updated: 13/02/2026
 #
-# Script Purpose: This script is an Adobe cleanup/uninstaller that enforces removal of Adobe apps from 2023 and earlier, optionally lets the user review the list, 
-# and then uses Adobe’s own uninstaller plus some manual cleanup to remove the old software from the Mac.
+# Script Purpose: Selectively remove Adobe apps from a users system
 #
 # 1.0 - Initial
 # 1.1 - Changed buttons to "Next" and "Remove" on the appropriate screens
