@@ -1,0 +1,46 @@
+#!/bin/bash
+
+ADOBE_SETUP="/Library/Application Support/Adobe/Adobe Desktop Common/HDBox/Setup"
+PLATFORM=$(/usr/bin/arch)
+ARCH=$([[ "$PLATFORM" == "arm64" ]] && echo "arm64" || echo "Intel")
+
+if [ ! -f "$ADOBE_SETUP" ]; then
+  echo "Adobe Setup tool not found. Exiting."
+  exit 1
+fi
+
+echo "Uninstalling older Adobe apps"
+
+# Format: "SAP_CODE MIN_VERSION MAX_VERSION"  # Product name
+app_list=(
+  "PHSP 20 24"   # Photoshop
+  "ILST 23 27"   # Illustrator
+  "IDSN 14 18"   # InDesign
+  "AICY 14 18"   # InCopy
+  "PPRO 13 23"   # Premiere Pro
+  "AEFT 16 23"   # After Effects
+  "AUDT 12 23"   # Audition
+  "FLPR 19 23"   # Animate
+  #"DRWV 19 21"   # Dreamweaver
+  #"RUSH 1 2"     # Premiere Rush
+  "APRO 19 23"   # Acrobat DC
+  "AME 13 23"    # Media Encoder
+  "KBRG 9 13"    # Bridge
+  "CHAR 19 23"   # Character Animator
+)
+
+for entry in "${app_list[@]}"; do
+  set -- $entry
+  sapCode=$1
+  min=$2
+  max=$3
+
+  for version in $(seq "$min" "$max"); do
+    baseVersion="${version}.0"
+    echo "→ Uninstalling $sapCode version $baseVersion"
+    "$ADOBE_SETUP" --uninstall=1 --sapCode="$sapCode" --baseVersion="$baseVersion" --platform="$ARCH" --deleteUserPreferences=false
+  done
+done
+
+echo "All specified Adobe apps uninstalled."
+exit 0
