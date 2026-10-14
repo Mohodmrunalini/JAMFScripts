@@ -1,0 +1,143 @@
+#!/bin/zsh
+# Mass unmange Jamf mobile devices based on advanced search results
+
+# Variables
+jamfUser="$4"
+jamfPassword="$5"
+jamfapiURL="https://glbmdm.condenast.com"
+jamfSearchID="$6"
+dateTime=$(date '+%Y-%m-%d %H%M%S')
+logFile="/Library/Logs/unmanageMobileDevices-$dateTime.log"
+bearerToken=""
+tokenExpirationEpoch="0"
+
+# Functions
+# Parse JSON - parse returned data from Jamf Pro
+getJson() {
+  # $1: JSON string to parse, $2: JSON key to look up
+  JSON="$1" osascript -l 'JavaScript' \
+    -e 'const env = $.NSProcessInfo.processInfo.environment.objectForKey("JSON").js' \
+    -e "JSON.parse(env).$2"
+}
+
+unmanagedDevice() {
+curl -s --location --globoff --request PUT "${jamfapiURL}/JSSResource/mobiledevices/id/$1" \
+     --header "Accept: application/xml" \
+     --header "Content-Type: application/xml" \
+     --header "Authorization: Bearer ${bearerToken}" \
+     --data "<mobile_device>
+                <general>
+                        <managed>false</managed>
+                </general>
+            </mobile_device>" > /dev/null
+}
+
+{
+echo ""
+echo "*********************************************************************************************************"
+echo " #     #                                                     ######                                       "
+echo " #     # #    # #    #   ##   #    #   ##    ####  ######    #     # ###### #    # #  ####  ######  ####  "
+echo " #     # ##   # ##  ##  #  #  ##   #  #  #  #    # #         #     # #      #    # # #    # #      #      "
+echo " #     # # #  # # ## # #    # # #  # #    # #      #####     #     # #####  #    # # #      #####   ####  "
+echo " #     # #  # # #    # ###### #  # # ###### #  ### #         #     # #      #    # # #      #           # "
+echo " #     # #   ## #    # #    # #   ## #    # #    # #         #     # #       #  #  # #    # #      #    # "
+echo "  #####  #    # #    # #    # #    # #    #  ####  ######    ######  ######   ##   #  ####  ######  ####  "
+echo ""
+echo "  $(date)"
+echo "*********************************************************************************************************"  
+echo ""                                                                                                      
+} >> $logFile
+
+# Check script parameter vaules ( $4, $5, $6 )
+if [[ -z "$4" ]] || [[ -z "$5" ]] || [[ -z "$6" ]]; then
+    echo "$(date): Missing script parameter values, exiting..." >> $logFile
+    osascript -e 'display dialog "Missing script parameter values, exiting..." buttons {"Exit"} default button 1 with title "CN Unmanage Devices" with icon stop'
+    exit 2
+fi
+
+# Get Bearer Token
+echo "$(date): Getting bearer token from Jamf Pro..." >> $logFile
+response=$(curl -s -u "$jamfUser":"$jamfPassword" "${jamfapiURL}"/api/v1/auth/token -X POST)
+bearerToken=$(echo "$response" | plutil -extract token raw -)
+tokenExpiration=$(echo "$response" | plutil -extract expires raw - | awk -F . '{print $1}')
+tokenExpirationEpoch=$(date -j -f "%Y-%m-%dT%T" "$tokenExpiration" +"%s")
+if [[ $? == 0 ]]; then
+    echo "$(date): Bearer token created." >> $logFile
+    echo "$(date): Token UTC expiry - $tokenExpiration"  >> $logFile
+else
+    echo "$(date): Unable to create bearer token - error $?" >> $logFile
+    exit
+fi
+
+# Lookup advanced search in Jamf, read out search results
+echo "$(date): Getting devices from Jamf Pro advanced search..." >> $logFile
+getDevices=$(curl -s --location "${jamfapiURL}/JSSResource/advancedmobiledevicesearches/id/${jamfSearchID}" \
+--header "Accept: application/json" \
+--header "Content-Type: application/json" \
+--header "Authorization: Bearer ${bearerToken}")
+#echo $getDevices
+if [[ $? == 0 ]]; then
+    echo "$(date): Exported devices as JSON." >> $logFile
+else
+    echo "$(date): Unable export device data - error $?" >> $logFile
+    exit
+fi
+
+jsonArrayLength=$(getJson "$getDevices" 'advanced_mobile_device_search.mobile_devices.length')
+echo "$(date): $jsonArrayLength objects listed in the exported JSON." >> $logFile
+
+# Loop though returned JSON and append each device to array
+n=0
+deviceArray=()
+while [ "$n" -lt "$jsonArrayLength" ]; do
+    getParsedDevice=$(getJson "$getDevices" "advanced_mobile_device_search.mobile_devices[$n].id")
+    deviceArray+=(${getParsedDevice})
+    echo "$(date): Added device with Jamf ID: ${getParsedDevice} to array" >> $logFile
+    n=$((n+1))
+done
+if [[ $? == 0 ]]; then
+    echo "$(date): Array of devices created." >> $logFile
+    getButton=$(osascript -e 'display dialog "'$n' devices found, click yes to continue with device unmanagement" buttons {"Exit", "Yes"} default button 1 with title "CN Unmanage Devices" with icon caution')
+    if [[ $getButton == "button returned:Yes" ]]; then
+        echo "$(date): Yes selected, user continuing operation" >> $logFile
+    else
+        echo "$(date): Exit selected, user canceled operation" >> $logFile
+        echo "" >> $logFile
+        echo "*********************************************************************************************************" >> $logFile
+        exit
+    fi
+else
+    echo "$(date): Unable to create or complete device array - error $?" >> $logFile
+    exit
+fi
+
+echo "$(date): Total devices in array: ${n}" >> $logFile
+#echo "${deviceArray[@]}"
+
+# Loop though the device array and change the Jamf managment satus for each device to false
+echo "$(date): Starting device unmanage..." >> $logFile
+for i in "${deviceArray[@]}"
+do
+unmanagedDevice "$i"
+echo "$(date): Device ID: $i unmanaged in Jamf" >> $logFile
+done
+if [[ $? == 0 ]]; then
+    echo "$(date): Device unmanage completed." >> $logFile
+    osascript -e 'display dialog "Device unmanage completed. Logs at '$logFile'" buttons {"OK"} default button 1 with title "CN Unmanage Devices" with icon POSIX file "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertNoteIcon.icns"'
+else
+    echo "$(date): Device unamage failed to run or complete - error $?" >> $logFile
+    echo "" >> $logFile
+    echo "*********************************************************************************************************" >> $logFile
+    osascript -e 'display dialog "Device unamage failed to run or complete. Logs at '$logFile'" buttons {"Exit"} default button 1 with title "CN Unmanage Devices" with icon stop'
+    exit 1
+fi
+
+{
+echo ""
+echo "*********************************************************************************************************"
+echo "Mass unmange Jamf devices finished"
+echo "ID of Jamf Pro advanced search: $jamfSearchID"
+echo "Unamanged $n devices in Jamf Pro"
+echo "$(date)"
+echo "*********************************************************************************************************"
+} >> $logFile
